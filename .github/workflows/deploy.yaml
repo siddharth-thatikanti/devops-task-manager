@@ -1,4 +1,3 @@
-
 name: Build and Deploy Task Manager
 
 on:
@@ -37,7 +36,6 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set Up Docker Buildx
@@ -76,21 +74,69 @@ jobs:
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           EC2_HOST: ${{ secrets.EC2_HOST }}
+        shell: bash
         run: |
           set -eu
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
-          chmod 600 ~/.ssh/ec2_key
 
-          # For stronger security, pin a host key verified independently.
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          if [ -z "$EC2_HOST" ]; then
+            echo "ERROR: EC2_HOST secret is missing or empty."
+            exit 1
+          fi
+
+          if [ -z "$EC2_SSH_KEY" ]; then
+            echo "ERROR: EC2_SSH_KEY secret is missing or empty."
+            exit 1
+          fi
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/ec2_key"
+          chmod 600 "$HOME/.ssh/ec2_key"
+
+          if ! ssh-keygen -y -f "$HOME/.ssh/ec2_key" \
+              > /dev/null 2> "$RUNNER_TEMP/ssh-key-error.log"; then
+            echo "ERROR: EC2_SSH_KEY is not a valid private key."
+            cat "$RUNNER_TEMP/ssh-key-error.log"
+            exit 1
+          fi
+
+          touch "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          echo "Checking SSH connectivity to EC2..."
+
+          if ! ssh-keyscan -T 10 -v -H "$EC2_HOST" \
+              >> "$HOME/.ssh/known_hosts" \
+              2> "$RUNNER_TEMP/ssh-keyscan.log"; then
+            echo "ERROR: ssh-keyscan could not retrieve the EC2 host key."
+            echo "Check EC2_HOST, public IP, port 22, security group, and network."
+            cat "$RUNNER_TEMP/ssh-keyscan.log"
+            exit 1
+          fi
+
+          if [ ! -s "$HOME/.ssh/known_hosts" ]; then
+            echo "ERROR: No SSH host key was retrieved."
+            exit 1
+          fi
+
+          echo "SSH key validated and host key retrieved."
+
+      - name: Test SSH Connection
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh -i "$HOME/.ssh/ec2_key" \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            ubuntu@"$EC2_HOST" \
+            'echo "SSH connection successful"'
 
       - name: Prepare EC2 Directory
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
-          ssh -i ~/.ssh/ec2_key \
+          ssh -i "$HOME/.ssh/ec2_key" \
             -o StrictHostKeyChecking=yes \
             ubuntu@"$EC2_HOST" \
             'mkdir -p ~/devops-task-manager'
@@ -99,45 +145,46 @@ jobs:
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
-          scp -i ~/.ssh/ec2_key \
+          scp -i "$HOME/.ssh/ec2_key" \
             -o StrictHostKeyChecking=yes \
             docker-compose.yml \
             ubuntu@"$EC2_HOST":~/devops-task-manager/docker-compose.yml
 
-      - name: Pull Images and Restart Application
+      - name: Pull Images and Deploy
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          ssh -i ~/.ssh/ec2_key \
+          ssh -i "$HOME/.ssh/ec2_key" \
             -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
             ubuntu@"$EC2_HOST" \
             "IMAGE_TAG='$IMAGE_TAG' AWS_REGION='${AWS_REGION}' AWS_ACCOUNT_ID='${AWS_ACCOUNT_ID}' bash -s" <<'REMOTE'
           set -eu
 
           cd ~/devops-task-manager
 
-          # Confirm AWS CLI and EC2 instance-role credentials work.
+          if [ ! -f .env ]; then
+            echo "ERROR: ~/devops-task-manager/.env is missing."
+            echo "Create it with DB_NAME, DB_USER, and DB_PASSWORD."
+            exit 1
+          fi
+
+          # Use the EC2 instance role for AWS access.
           aws sts get-caller-identity
 
-          # Authenticate Docker to ECR using the EC2 instance role.
+          # Authenticate Docker to ECR.
           aws ecr get-login-password --region "$AWS_REGION" \
             | docker login \
               --username AWS \
               --password-stdin \
               "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-          # Use the exact commit that triggered this deployment.
+          # Deploy the exact images built for this commit.
           export FRONTEND_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dtsm-frontend:${IMAGE_TAG}"
           export BACKEND_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dtsm-backend:${IMAGE_TAG}"
 
-          # Ensure the EC2-side database configuration exists.
-          test -f .env || {
-            echo "ERROR: ~/devops-task-manager/.env is missing"
-            exit 1
-          }
-
-          # Validate configuration, pull images, and deploy.
+          # Validate, pull and start the application.
           docker compose config --quiet
           docker compose pull
           docker compose up -d --remove-orphans
