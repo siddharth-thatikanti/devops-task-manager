@@ -1,38 +1,145 @@
 
-name: Build and Deploy to AWS
+name: Build and Deploy Task Manager
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: task-manager-deployment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-2
+  AWS_ACCOUNT_ID: "633160613557"
+  FRONTEND_REPOSITORY: dtsm-frontend
+  BACKEND_REPOSITORY: dtsm-backend
+
 jobs:
   build-and-push:
+    name: Build and Push Docker Images
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: login-ecr
+        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build Docker image
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            633160613557.dkr.ecr.ap-southeast-2.amazonaws.com/dtsm-frontend:${{ github.sha }}
+            633160613557.dkr.ecr.ap-southeast-2.amazonaws.com/dtsm-frontend:latest
+
+      - name: Build and Push Backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            633160613557.dkr.ecr.ap-southeast-2.amazonaws.com/dtsm-backend:${{ github.sha }}
+            633160613557.dkr.ecr.ap-southeast-2.amazonaws.com/dtsm-backend:latest
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
         env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          REPOSITORY: devops-task-manager
-          TAG: ${{ github.sha }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
-          docker build -t "$REGISTRY/$REPOSITORY:$TAG" .
-          docker push "$REGISTRY/$REPOSITORY:$TAG"
+          set -eu
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+          # For stronger security, pin a host key verified independently.
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Prepare EC2 Directory
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            ubuntu@"$EC2_HOST" \
+            'mkdir -p ~/devops-task-manager'
+
+      - name: Copy Compose File to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          scp -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            docker-compose.yml \
+            ubuntu@"$EC2_HOST":~/devops-task-manager/docker-compose.yml
+
+      - name: Pull Images and Restart Application
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            -o StrictHostKeyChecking=yes \
+            ubuntu@"$EC2_HOST" \
+            "IMAGE_TAG='$IMAGE_TAG' AWS_REGION='${AWS_REGION}' AWS_ACCOUNT_ID='${AWS_ACCOUNT_ID}' bash -s" <<'REMOTE'
+          set -eu
+
+          cd ~/devops-task-manager
+
+          # Confirm AWS CLI and EC2 instance-role credentials work.
+          aws sts get-caller-identity
+
+          # Authenticate Docker to ECR using the EC2 instance role.
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login \
+              --username AWS \
+              --password-stdin \
+              "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          # Use the exact commit that triggered this deployment.
+          export FRONTEND_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dtsm-frontend:${IMAGE_TAG}"
+          export BACKEND_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dtsm-backend:${IMAGE_TAG}"
+
+          # Ensure the EC2-side database configuration exists.
+          test -f .env || {
+            echo "ERROR: ~/devops-task-manager/.env is missing"
+            exit 1
+          }
+
+          # Validate configuration, pull images, and deploy.
+          docker compose config --quiet
+          docker compose pull
+          docker compose up -d --remove-orphans
+          docker compose ps
+          REMOTE

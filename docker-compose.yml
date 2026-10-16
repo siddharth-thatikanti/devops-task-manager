@@ -1,7 +1,7 @@
 
 services:
   frontend:
-    build: ./frontend
+    image: ${FRONTEND_IMAGE:?Set FRONTEND_IMAGE}
     container_name: frontend
     ports:
       - "8080:80"
@@ -10,8 +10,9 @@ services:
     restart: unless-stopped
     networks:
       - app-network
+
   backend:
-    build: ./backend
+    image: ${BACKEND_IMAGE:?Set BACKEND_IMAGE}
     container_name: backend
     ports:
       - "5000:5000"
@@ -20,9 +21,9 @@ services:
       PORT: 5000
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:?Set DB_NAME in .env}
+      DB_USER: ${DB_USER:?Set DB_USER in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
     depends_on:
       postgres:
         condition: service_healthy
@@ -34,13 +35,15 @@ services:
     image: postgres:16-alpine
     container_name: postgres
     environment:
-      POSTGRES_DB: ${DB_NAME}
-      POSTGRES_USER: ${DB_USER}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:?Set DB_NAME in .env}
+      POSTGRES_USER: ${DB_USER:?Set DB_USER in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
       interval: 10s
       timeout: 5s
       retries: 5
