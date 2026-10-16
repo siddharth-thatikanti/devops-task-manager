@@ -72,10 +72,49 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Normalize EC2 SSH Target
+        env:
+          EC2_HOST_RAW: ${{ secrets.EC2_HOST }}
+        run: |
+          set -eu
+
+          target="${EC2_HOST_RAW#ssh://}"
+          user="ubuntu"
+          port="22"
+
+          if [[ "$target" == *"@"* ]]; then
+            user="${target%@*}"
+            target="${target#*@}"
+          fi
+
+          if [[ "$target" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+            host="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[2]}"
+          elif [[ "$target" =~ ^([^:]+):([0-9]+)$ ]]; then
+            host="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[2]}"
+          else
+            host="$target"
+          fi
+
+          case "$port" in
+            ''|*[!0-9]*)
+              echo "ERROR: EC2_HOST contains an invalid SSH port: $port"
+              exit 1
+              ;;
+          esac
+
+          test -n "$host"
+
+          {
+            echo "EC2_SSH_USER=$user"
+            echo "EC2_SSH_HOST=$host"
+            echo "EC2_SSH_PORT=$port"
+          } >> "$GITHUB_ENV"
+
       - name: Configure SSH
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-          EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           set -eu
           mkdir -p ~/.ssh
@@ -84,34 +123,32 @@ jobs:
           chmod 600 ~/.ssh/ec2_key
 
           # For stronger security, pin a host key verified independently.
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          ssh-keyscan -p "$EC2_SSH_PORT" -H "$EC2_SSH_HOST" >> ~/.ssh/known_hosts
 
       - name: Prepare EC2 Directory
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           ssh -i ~/.ssh/ec2_key \
             -o StrictHostKeyChecking=yes \
-            ubuntu@"$EC2_HOST" \
+            -p "$EC2_SSH_PORT" \
+            "$EC2_SSH_USER@$EC2_SSH_HOST" \
             'mkdir -p ~/devops-task-manager'
 
       - name: Copy Compose File to EC2
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
         run: |
           scp -i ~/.ssh/ec2_key \
             -o StrictHostKeyChecking=yes \
+            -P "$EC2_SSH_PORT" \
             docker-compose.yml \
-            ubuntu@"$EC2_HOST":~/devops-task-manager/docker-compose.yml
+            "$EC2_SSH_USER@$EC2_SSH_HOST":~/devops-task-manager/docker-compose.yml
 
       - name: Pull Images and Restart Application
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           ssh -i ~/.ssh/ec2_key \
             -o StrictHostKeyChecking=yes \
-            ubuntu@"$EC2_HOST" \
+            -p "$EC2_SSH_PORT" \
+            "$EC2_SSH_USER@$EC2_SSH_HOST" \
             "IMAGE_TAG='$IMAGE_TAG' AWS_REGION='${AWS_REGION}' AWS_ACCOUNT_ID='${AWS_ACCOUNT_ID}' bash -s" <<'REMOTE'
           set -eu
 
